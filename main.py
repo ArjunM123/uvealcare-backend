@@ -176,9 +176,53 @@ def get_case(case_id: str, current_user: User = Depends(get_current_user), db: S
         "mrn": case.patient.mrn,
         "diagnosis": case.patient.diagnosis,
         "laterality": case.patient.laterality,
+        "dob": case.patient.dob.isoformat() if case.patient.dob else None,
+        "sex": case.patient.sex,
+        "phone": case.patient.phone,
+        "insurance": case.patient.insurance,
+        "primary_provider": case.patient.primary_provider,
+        "referring_provider": case.patient.referring_provider,
         "disease_profile": case.disease_profile.key,
         "care_stage": case.care_stage,
         "care_stages": json.loads(case.disease_profile.care_stages),
+    }
+
+
+class PatientUpdateIn(BaseModel):
+    sex: Optional[str] = None
+    phone: Optional[str] = None
+    insurance: Optional[str] = None
+    primary_provider: Optional[str] = None
+    referring_provider: Optional[str] = None
+
+
+@app.patch("/cases/{case_id}/patient")
+def update_patient_info(case_id: str, payload: PatientUpdateIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Lets the demographic/contact fields the app previously always showed
+    as 'Not recorded' actually be filled in and saved — this is real
+    data now, editable through the UI, not a placeholder.
+    """
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    patient = case.patient
+    # Only update fields that were actually included in the request —
+    # this lets the frontend save one field at a time if it wants to,
+    # without accidentally blanking out the others.
+    update_data = payload.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(patient, field, value)
+
+    db.commit()
+    return {
+        "ok": True,
+        "sex": patient.sex,
+        "phone": patient.phone,
+        "insurance": patient.insurance,
+        "primary_provider": patient.primary_provider,
+        "referring_provider": patient.referring_provider,
     }
 
 

@@ -42,6 +42,11 @@ class Patient(Base):
     dob = Column(Date, nullable=False)
     laterality = Column(String, nullable=True)  # OD / OS / OU — optional, not every disease has this
     diagnosis = Column(String, nullable=True)  # display text, e.g. "Choroidal Melanoma OD"
+    sex = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    insurance = Column(String, nullable=True)
+    primary_provider = Column(String, nullable=True)
+    referring_provider = Column(String, nullable=True)
 
     cases = relationship("Case", back_populates="patient")
 

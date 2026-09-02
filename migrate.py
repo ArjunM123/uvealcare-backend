@@ -19,6 +19,11 @@ from database import engine
 # Format: (table_name, column_name, column_type_sql)
 NEW_COLUMNS = [
     ("decisions", "surveillance_protocol", "VARCHAR"),
+    ("patients", "sex", "VARCHAR"),
+    ("patients", "phone", "VARCHAR"),
+    ("patients", "insurance", "VARCHAR"),
+    ("patients", "primary_provider", "VARCHAR"),
+    ("patients", "referring_provider", "VARCHAR"),
 ]
 
 
