@@ -11,7 +11,7 @@ import os
 import datetime as dt
 
 from database import get_db, init_db
-from models import Case, DataFieldDefinition, DataValue, DiseaseProfile, Patient, User, Decision, Task
+from models import Case, DataFieldDefinition, DataValue, DiseaseProfile, Patient, User, Decision, Task, ImageUpload
 
 app = FastAPI(title="Clinical Workflow Platform API")
 
@@ -553,3 +553,84 @@ def create_patient(payload: PatientIn, current_user: User = Depends(get_current_
     db.commit()
 
     return {"case_id": case.id, "patient_id": patient.id, "mrn": patient.mrn, "name": patient.name}
+
+
+class ImageUploadIn(BaseModel):
+    field_key: str
+    filename: str
+    content_type: str
+    data_base64: str  # raw base64 payload, no "data:...;base64," prefix
+
+
+MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB — generous for a demo photo, small enough to keep this reasonable
+
+
+@app.post("/cases/{case_id}/images")
+def upload_image(case_id: str, payload: ImageUploadIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Stores a real image for one field on one case. Replaces any existing
+    image for that same field — same upsert pattern as recording a
+    regular data value, just for image content instead of text.
+    """
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    import base64
+    try:
+        decoded = base64.b64decode(payload.data_base64)
+    except Exception:
+        raise HTTPException(400, "Invalid image data.")
+
+    if len(decoded) > MAX_IMAGE_BYTES:
+        raise HTTPException(400, f"Image too large — max {MAX_IMAGE_BYTES // (1024*1024)}MB.")
+
+    if not payload.content_type.startswith("image/"):
+        raise HTTPException(400, "Only image files are accepted.")
+
+    existing = db.query(ImageUpload).filter_by(case_id=case_id, field_key=payload.field_key).first()
+    if existing:
+        existing.filename = payload.filename
+        existing.content_type = payload.content_type
+        existing.data_base64 = payload.data_base64
+    else:
+        db.add(ImageUpload(
+            case_id=case_id,
+            field_key=payload.field_key,
+            filename=payload.filename,
+            content_type=payload.content_type,
+            data_base64=payload.data_base64,
+        ))
+    db.commit()
+    return {"ok": True, "field_key": payload.field_key, "filename": payload.filename}
+
+
+@app.get("/cases/{case_id}/images")
+def list_images(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Lists which fields have a real uploaded image, without sending the
+    (potentially large) image data itself — the frontend uses this to
+    know which studies show a real photo vs. just a text finding."""
+    images = db.query(ImageUpload).filter_by(case_id=case_id).all()
+    return [
+        {"field_key": img.field_key, "filename": img.filename, "uploaded_at": img.uploaded_at.isoformat() if img.uploaded_at else None}
+        for img in images
+    ]
+
+
+from fastapi.responses import Response as FastAPIResponse
+
+
+@app.get("/cases/{case_id}/images/{field_key}")
+def get_image(case_id: str, field_key: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Returns the actual raw image bytes for one field. This stays behind
+    the same authentication as everything else — unlike a plain <img>
+    tag pointed at a public URL, the frontend has to fetch this with a
+    valid token, same as any other protected endpoint.
+    """
+    import base64
+    img = db.query(ImageUpload).filter_by(case_id=case_id, field_key=field_key).first()
+    if not img:
+        raise HTTPException(404, "No image uploaded for this field.")
+    raw = base64.b64decode(img.data_base64)
+    return FastAPIResponse(content=raw, media_type=img.content_type)

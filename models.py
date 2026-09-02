@@ -142,3 +142,28 @@ class Decision(Base):
     recorded_at = Column(DateTime, server_default=func.now())
 
     case = relationship("Case")
+
+
+class ImageUpload(Base):
+    """
+    A real uploaded image (e.g. a B-scan or OCT photo) tied to one
+    specific field on one case — at most one image per field per case;
+    uploading again replaces the previous one, same pattern as DataValue.
+
+    Stored directly in Postgres as base64 text rather than a separate
+    file-storage service. This keeps the whole app on infrastructure
+    that's already set up (no new accounts, no new API keys) — a
+    reasonable tradeoff at demo scale, though a real production system
+    with many large images would eventually want dedicated object
+    storage (e.g. S3) instead.
+    """
+    __tablename__ = "image_uploads"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    case_id = Column(String, ForeignKey("cases.id"), nullable=False)
+    field_key = Column(String, nullable=False)
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=False)
+    data_base64 = Column(Text, nullable=False)
+    uploaded_at = Column(DateTime, server_default=func.now())
+
+    case = relationship("Case")
