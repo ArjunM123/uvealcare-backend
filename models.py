@@ -32,7 +32,6 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     role = Column(String, nullable=False)  # ophthalmologist, radiation_oncologist, nurse, etc.
     password_hash = Column(String, nullable=False)  # bcrypt hash — never store plain text
-    password_hash = Column(String, nullable=True)  # set by seed.py; see auth.py for hashing
 
 
 class Patient(Base):

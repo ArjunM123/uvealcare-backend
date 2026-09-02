@@ -116,6 +116,48 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     }
 
 
+class SignupRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str = "clinician"
+
+
+@app.post("/signup")
+def signup(payload: SignupRequest, db: Session = Depends(get_db)):
+    """
+    Creates a real account — this is the piece that was missing before:
+    the app only ever had one hardcoded demo login. Passwords are hashed
+    with bcrypt before storage, exactly like the seeded demo account,
+    and a real token is issued immediately so a new user lands signed in,
+    the same as after a normal login.
+    """
+    existing = db.query(User).filter_by(email=payload.email).first()
+    if existing:
+        raise HTTPException(400, "An account with this email already exists.")
+
+    if len(payload.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters.")
+
+    hashed = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+    user = User(
+        name=payload.name,
+        email=payload.email,
+        role=payload.role,
+        password_hash=hashed,
+    )
+    db.add(user)
+    db.commit()
+
+    return {
+        "ok": True,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "token": create_access_token(user),
+    }
+
+
 class DataValueIn(BaseModel):
     field_key: str
     value: Optional[str] = None
