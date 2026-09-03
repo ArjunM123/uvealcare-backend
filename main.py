@@ -163,6 +163,11 @@ class DataValueIn(BaseModel):
     value: Optional[str] = None
     status: str = "complete"  # "complete" | "missing" | "pending"
     source: Optional[str] = None
+    # Only meaningful for measurement-category fields — see DataValue
+    # model for why this exists.
+    measurement_method: Optional[str] = None
+    measurement_precision: Optional[str] = None
+    measurement_length_type: Optional[str] = None
 
 
 @app.get("/cases/{case_id}")
@@ -248,10 +253,16 @@ def record_value(case_id: str, payload: DataValueIn, current_user: User = Depend
         existing.value = payload.value
         existing.status = payload.status
         existing.source = payload.source
+        existing.measurement_method = payload.measurement_method
+        existing.measurement_precision = payload.measurement_precision
+        existing.measurement_length_type = payload.measurement_length_type
     else:
         existing = DataValue(
             case_id=case_id, field_definition_id=field_def.id,
             value=payload.value, status=payload.status, source=payload.source,
+            measurement_method=payload.measurement_method,
+            measurement_precision=payload.measurement_precision,
+            measurement_length_type=payload.measurement_length_type,
         )
         db.add(existing)
 
@@ -297,6 +308,9 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
             "status": status,
             "value": val.value if val else None,
             "source": val.source if val else None,
+            "measurement_method": val.measurement_method if val else None,
+            "measurement_precision": val.measurement_precision if val else None,
+            "measurement_length_type": val.measurement_length_type if val else None,
         })
 
     pct = round((complete_count / len(required_fields)) * 100) if required_fields else 0

@@ -30,6 +30,7 @@ UM_FIELDS = [
     ("optos", "Optos", "imaging", "status", True),
     ("faf", "FAF", "imaging", "status", True),
     ("gep_result", "Molecular testing / GEP", "molecular", "status", True),
+    ("patient_counseling", "Patient Counseling", "patient_support", "text", True),
 ]
 
 # A genuinely different disease — different care stages, different imaging
@@ -51,6 +52,7 @@ SARCOMA_FIELDS = [
     ("ct_chest", "CT chest (staging)", "imaging", "status", True),
     ("biopsy_pathology", "Core needle biopsy", "pathology", "status", True),
     ("molecular_profile", "Molecular / genomic testing", "molecular", "status", True),
+    ("patient_counseling", "Patient Counseling", "patient_support", "text", True),
 ]
 
 

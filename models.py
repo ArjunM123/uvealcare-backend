@@ -112,6 +112,19 @@ class DataValue(Base):
     source = Column(String, nullable=True)       # e.g. "technician: J. Alvarez"
     recorded_at = Column(DateTime, server_default=func.now())
 
+    # Measurement standardization metadata — only meaningful for
+    # "measurement" category fields (e.g. tumor dimensions), left null
+    # otherwise. This exists specifically because a real ocular oncologist
+    # pointed out that published studies almost never document who
+    # measured a tumor, by what method, to what precision, or whether a
+    # basal diameter was a chord-length or an arc-length — and that this
+    # ambiguity is a genuine source of error in the field. Capturing it
+    # here is a direct, structural answer to that critique, not a
+    # generic feature.
+    measurement_method = Column(String, nullable=True)   # e.g. "B-scan ultrasonography", "Indirect ophthalmoscopy"
+    measurement_precision = Column(String, nullable=True)  # e.g. "Nearest 0.1 mm"
+    measurement_length_type = Column(String, nullable=True)  # "Chord length" | "Arc length" | "Not specified"
+
     case = relationship("Case", back_populates="values")
     field_definition = relationship("DataFieldDefinition")
 

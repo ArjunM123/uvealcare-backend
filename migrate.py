@@ -24,6 +24,9 @@ NEW_COLUMNS = [
     ("patients", "insurance", "VARCHAR"),
     ("patients", "primary_provider", "VARCHAR"),
     ("patients", "referring_provider", "VARCHAR"),
+    ("data_values", "measurement_method", "VARCHAR"),
+    ("data_values", "measurement_precision", "VARCHAR"),
+    ("data_values", "measurement_length_type", "VARCHAR"),
 ]
 
 
