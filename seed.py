@@ -31,6 +31,13 @@ UM_FIELDS = [
     ("faf", "FAF", "imaging", "status", True),
     ("gep_result", "Molecular testing / GEP", "molecular", "status", True),
     ("patient_counseling", "Patient Counseling", "patient_support", "text", True),
+    # Added directly in response to real clinical feedback from a
+    # practicing ocular oncologist on what's needed before treatment
+    # planning — see add_augsburger_feedback_fields.py for context.
+    ("fellow_eye_status", "Fellow Eye Visual Status", "clinical", "text", True),
+    ("metastatic_workup", "Baseline Metastatic Workup", "systemic_workup", "text", True),
+    ("prior_treatment", "Prior Treatment History", "clinical", "text", True),
+    ("psychosocial_factors", "Psychosocial / Treatment Acceptance Factors", "patient_support", "text", True),
 ]
 
 # A genuinely different disease — different care stages, different imaging
@@ -53,6 +60,12 @@ SARCOMA_FIELDS = [
     ("biopsy_pathology", "Core needle biopsy", "pathology", "status", True),
     ("molecular_profile", "Molecular / genomic testing", "molecular", "status", True),
     ("patient_counseling", "Patient Counseling", "patient_support", "text", True),
+    # Same three general-oncology fields added to uveal melanoma — these
+    # apply regardless of disease. fellow_eye_status is intentionally
+    # NOT added here since it's specific to an eye disease.
+    ("metastatic_workup", "Baseline Metastatic Workup", "systemic_workup", "text", True),
+    ("prior_treatment", "Prior Treatment History", "clinical", "text", True),
+    ("psychosocial_factors", "Psychosocial / Treatment Acceptance Factors", "patient_support", "text", True),
 ]
 
 
