@@ -270,6 +270,35 @@ def record_value(case_id: str, payload: DataValueIn, current_user: User = Depend
     return {"ok": True, "field": field_def.label, "status": existing.status}
 
 
+@app.delete("/cases/{case_id}/values/{field_key}")
+def delete_value(case_id: str, field_key: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Deletes a recorded value outright, rather than editing it — for
+    genuinely removing bad or mistaken data (e.g. entered on the wrong
+    patient) rather than correcting it. The field simply reverts to
+    Missing, same as if it had never been recorded.
+    """
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    field_def = db.query(DataFieldDefinition).filter_by(
+        disease_profile_id=case.disease_profile_id, key=field_key
+    ).first()
+    if not field_def:
+        raise HTTPException(404, "Unknown field for this disease profile")
+
+    existing = db.query(DataValue).filter_by(
+        case_id=case_id, field_definition_id=field_def.id
+    ).first()
+    if not existing:
+        raise HTTPException(404, "No recorded value to delete for this field")
+
+    db.delete(existing)
+    db.commit()
+    return {"ok": True, "field": field_def.label, "deleted": True}
+
+
 @app.get("/cases/{case_id}/readiness")
 def get_readiness(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -692,3 +721,16 @@ def get_image(case_id: str, field_key: str, current_user: User = Depends(get_cur
         raise HTTPException(404, "No image uploaded for this field.")
     raw = base64.b64decode(img.data_base64)
     return FastAPIResponse(content=raw, media_type=img.content_type)
+
+
+@app.delete("/cases/{case_id}/images/{field_key}")
+def delete_image(case_id: str, field_key: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Removes an uploaded image outright — previously the only option
+    was to overwrite it with a new upload, with no way to just remove a
+    wrong or unwanted image."""
+    img = db.query(ImageUpload).filter_by(case_id=case_id, field_key=field_key).first()
+    if not img:
+        raise HTTPException(404, "No image uploaded for this field.")
+    db.delete(img)
+    db.commit()
+    return {"ok": True, "field_key": field_key, "deleted": True}
