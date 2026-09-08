@@ -395,6 +395,7 @@ def list_cases(current_user: User = Depends(get_current_user), db: Session = Dep
             "care_stage": case.care_stage,
             "readiness_pct": pct,
             "status": status,
+            "disease_profile_key": case.disease_profile.key,
         })
     return results
 
