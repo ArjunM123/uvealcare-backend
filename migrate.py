@@ -27,6 +27,7 @@ NEW_COLUMNS = [
     ("data_values", "measurement_method", "VARCHAR"),
     ("data_values", "measurement_precision", "VARCHAR"),
     ("data_values", "measurement_length_type", "VARCHAR"),
+    ("tasks", "assignee_id", "VARCHAR"),
 ]
 
 

@@ -488,8 +488,32 @@ def get_decision(case_id: str, current_user: User = Depends(get_current_user), d
 
 class TaskIn(BaseModel):
     description: str
-    assignee_name: Optional[str] = None
+    assignee_id: Optional[str] = None  # links to a real User — preferred
+    assignee_name: Optional[str] = None  # free text fallback — e.g. "Imaging Dept.", which isn't a real account
     due_date: Optional[str] = None  # "YYYY-MM-DD"
+
+
+def resolve_assignee_name(task: "Task") -> Optional[str]:
+    """
+    A task can be assigned to a real account (assignee_id) or to a plain
+    text label that isn't a real user (assignee_name — e.g. "Imaging
+    Dept."). This always returns the correct display name: the real
+    user's current name if one is linked (so it stays accurate even if
+    they update their name later), otherwise the free-text fallback.
+    """
+    if task.assignee_id and task.assignee:
+        return task.assignee.name
+    return task.assignee_name
+
+
+@app.get("/users")
+def list_users(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Lists every real account on the platform — this is what lets a
+    task be assigned to an actual person instead of just a typed name,
+    so 'who does this' is a real, queryable fact instead of free text
+    that could typo or go stale."""
+    users = db.query(User).order_by(User.name).all()
+    return [{"id": u.id, "name": u.name, "role": u.role} for u in users]
 
 
 @app.post("/cases/{case_id}/tasks")
@@ -506,6 +530,11 @@ def create_task(case_id: str, payload: TaskIn, current_user: User = Depends(get_
     if not case:
         raise HTTPException(404, "Case not found")
 
+    if payload.assignee_id:
+        assignee = db.query(User).filter_by(id=payload.assignee_id).first()
+        if not assignee:
+            raise HTTPException(404, "That user doesn't exist.")
+
     due = None
     if payload.due_date:
         try:
@@ -517,6 +546,7 @@ def create_task(case_id: str, payload: TaskIn, current_user: User = Depends(get_
     task = Task(
         case_id=case_id,
         description=payload.description,
+        assignee_id=payload.assignee_id,
         assignee_name=payload.assignee_name,
         due_date=due,
     )
@@ -525,7 +555,7 @@ def create_task(case_id: str, payload: TaskIn, current_user: User = Depends(get_
     return {
         "id": task.id,
         "description": task.description,
-        "assignee_name": task.assignee_name,
+        "assignee_name": resolve_assignee_name(task),
         "status": task.status,
         "due_date": task.due_date.isoformat() if task.due_date else None,
     }
@@ -541,7 +571,8 @@ def list_tasks(case_id: str, current_user: User = Depends(get_current_user), db:
         {
             "id": t.id,
             "description": t.description,
-            "assignee_name": t.assignee_name,
+            "assignee_name": resolve_assignee_name(t),
+            "assignee_id": t.assignee_id,
             "status": t.status,
             "due_date": t.due_date.isoformat() if t.due_date else None,
         }
@@ -567,7 +598,7 @@ def list_all_open_tasks(current_user: User = Depends(get_current_user), db: Sess
         {
             "id": t.id,
             "description": t.description,
-            "assignee_name": t.assignee_name,
+            "assignee_name": resolve_assignee_name(t),
             "due_date": t.due_date.isoformat() if t.due_date else None,
             "patient_name": t.case.patient.name,
         }
