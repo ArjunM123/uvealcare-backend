@@ -28,6 +28,8 @@ NEW_COLUMNS = [
     ("data_values", "measurement_precision", "VARCHAR"),
     ("data_values", "measurement_length_type", "VARCHAR"),
     ("tasks", "assignee_id", "VARCHAR"),
+    ("data_values", "basal_diameter_mm", "FLOAT"),
+    ("data_values", "apical_height_mm", "FLOAT"),
 ]
 
 

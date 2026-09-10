@@ -11,7 +11,7 @@ import os
 import datetime as dt
 
 from database import get_db, init_db
-from models import Case, DataFieldDefinition, DataValue, DiseaseProfile, Patient, User, Decision, Task, ImageUpload
+from models import Case, DataFieldDefinition, DataValue, DiseaseProfile, Patient, User, Decision, Task, ImageUpload, MeasurementHistory, TumorBoardMeeting
 
 app = FastAPI(title="Clinical Workflow Platform API")
 
@@ -168,6 +168,10 @@ class DataValueIn(BaseModel):
     measurement_method: Optional[str] = None
     measurement_precision: Optional[str] = None
     measurement_length_type: Optional[str] = None
+    # Structured numbers powering the real COMS tumor-size calculation —
+    # separate from the free-text `value` description above.
+    basal_diameter_mm: Optional[float] = None
+    apical_height_mm: Optional[float] = None
 
 
 @app.get("/cases/{case_id}")
@@ -256,6 +260,8 @@ def record_value(case_id: str, payload: DataValueIn, current_user: User = Depend
         existing.measurement_method = payload.measurement_method
         existing.measurement_precision = payload.measurement_precision
         existing.measurement_length_type = payload.measurement_length_type
+        existing.basal_diameter_mm = payload.basal_diameter_mm
+        existing.apical_height_mm = payload.apical_height_mm
     else:
         existing = DataValue(
             case_id=case_id, field_definition_id=field_def.id,
@@ -263,8 +269,28 @@ def record_value(case_id: str, payload: DataValueIn, current_user: User = Depend
             measurement_method=payload.measurement_method,
             measurement_precision=payload.measurement_precision,
             measurement_length_type=payload.measurement_length_type,
+            basal_diameter_mm=payload.basal_diameter_mm,
+            apical_height_mm=payload.apical_height_mm,
         )
         db.add(existing)
+
+    # For measurement-category fields, also append a permanent history
+    # entry — separate from the "current value" above — so tumor size
+    # can be tracked as a real trend across multiple visits, not just
+    # shown as a single most-recent number. Only logged when there's an
+    # actual value to record (not when clearing a field back to Missing).
+    if field_def.category == "measurement" and payload.status == "complete" and payload.value:
+        db.add(MeasurementHistory(
+            case_id=case_id,
+            field_key=payload.field_key,
+            value=payload.value,
+            measurement_method=payload.measurement_method,
+            measurement_precision=payload.measurement_precision,
+            measurement_length_type=payload.measurement_length_type,
+            basal_diameter_mm=payload.basal_diameter_mm,
+            apical_height_mm=payload.apical_height_mm,
+            source=payload.source,
+        ))
 
     db.commit()
     return {"ok": True, "field": field_def.label, "status": existing.status}
@@ -340,6 +366,8 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
             "measurement_method": val.measurement_method if val else None,
             "measurement_precision": val.measurement_precision if val else None,
             "measurement_length_type": val.measurement_length_type if val else None,
+            "basal_diameter_mm": val.basal_diameter_mm if val else None,
+            "apical_height_mm": val.apical_height_mm if val else None,
         })
 
     pct = round((complete_count / len(required_fields)) * 100) if required_fields else 0
@@ -766,3 +794,74 @@ def delete_image(case_id: str, field_key: str, current_user: User = Depends(get_
     db.delete(img)
     db.commit()
     return {"ok": True, "field_key": field_key, "deleted": True}
+
+
+class TumorBoardMeetingIn(BaseModel):
+    meeting_date: str  # "YYYY-MM-DD"
+
+
+@app.get("/tumor-board/next")
+def get_next_tumor_board(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Returns the single upcoming tumor board date, or null if none has
+    been set. This is what replaces the hardcoded 'November 14, 2024'
+    placeholder that used to appear regardless of which patient or which
+    actual day it was.
+    """
+    meeting = db.query(TumorBoardMeeting).order_by(TumorBoardMeeting.created_at.desc()).first()
+    if not meeting:
+        return None
+    return {"meeting_date": meeting.meeting_date.isoformat()}
+
+
+@app.post("/tumor-board/next")
+def set_next_tumor_board(payload: TumorBoardMeetingIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Sets the next tumor board date, replacing whichever one was set
+    before — kept deliberately simple (one shared date for the whole
+    platform) to match the app's current single-shared-account model,
+    rather than a full multi-meeting calendar.
+
+    Deletes any existing meeting row before inserting the new one,
+    rather than just inserting and sorting by creation time — two rows
+    created within the same second would otherwise make "which one is
+    newest" genuinely ambiguous.
+    """
+    from datetime import date
+    try:
+        parsed = date.fromisoformat(payload.meeting_date)
+    except ValueError:
+        raise HTTPException(400, "meeting_date must be in YYYY-MM-DD format.")
+
+    db.query(TumorBoardMeeting).delete()
+    db.add(TumorBoardMeeting(meeting_date=parsed))
+    db.commit()
+    return {"ok": True, "meeting_date": parsed.isoformat()}
+
+
+@app.get("/cases/{case_id}/measurements/{field_key}")
+def get_measurement_history(case_id: str, field_key: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Returns every past measurement ever recorded for this field on this
+    case, oldest first — this is what lets tumor size be shown as a real
+    trend across visits, not just the single most recent value.
+    """
+    history = (
+        db.query(MeasurementHistory)
+        .filter_by(case_id=case_id, field_key=field_key)
+        .order_by(MeasurementHistory.recorded_at.asc())
+        .all()
+    )
+    return [
+        {
+            "value": h.value,
+            "measurement_method": h.measurement_method,
+            "measurement_precision": h.measurement_precision,
+            "measurement_length_type": h.measurement_length_type,
+            "basal_diameter_mm": h.basal_diameter_mm,
+            "apical_height_mm": h.apical_height_mm,
+            "source": h.source,
+            "recorded_at": h.recorded_at.isoformat() if h.recorded_at else None,
+        }
+        for h in history
+    ]

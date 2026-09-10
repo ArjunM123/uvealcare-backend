@@ -125,8 +125,54 @@ class DataValue(Base):
     measurement_precision = Column(String, nullable=True)  # e.g. "Nearest 0.1 mm"
     measurement_length_type = Column(String, nullable=True)  # "Chord length" | "Arc length" | "Not specified"
 
+    # Structured numeric values, separate from the free-text `value`
+    # description above — these exist specifically to power the real
+    # COMS tumor-size classification (Small/Medium/Large), which
+    # requires two actual numbers to calculate, not a free-text
+    # description like "11.2 x 9.8mm basal, 4.6mm apical height".
+    basal_diameter_mm = Column(Float, nullable=True)
+    apical_height_mm = Column(Float, nullable=True)
+
     case = relationship("Case", back_populates="values")
     field_definition = relationship("DataFieldDefinition")
+
+
+class MeasurementHistory(Base):
+    """
+    An append-only log of every measurement ever recorded for a case —
+    separate from DataValue, which only ever holds the current/latest
+    value. This is what lets tumor size be tracked as a real trend over
+    multiple visits (useful for surveillance patients) instead of only
+    ever showing the single most recent measurement, the way the rest
+    of the app's fields work.
+    """
+    __tablename__ = "measurement_history"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    case_id = Column(String, ForeignKey("cases.id"), nullable=False)
+    field_key = Column(String, nullable=False)
+    value = Column(Text, nullable=True)
+    measurement_method = Column(String, nullable=True)
+    measurement_precision = Column(String, nullable=True)
+    measurement_length_type = Column(String, nullable=True)
+    basal_diameter_mm = Column(Float, nullable=True)
+    apical_height_mm = Column(Float, nullable=True)
+    source = Column(String, nullable=True)
+    recorded_at = Column(DateTime, server_default=func.now())
+
+    case = relationship("Case")
+
+
+class TumorBoardMeeting(Base):
+    """
+    The single upcoming tumor board date for the whole platform. Kept
+    deliberately simple to match the app's current single-shared-account
+    model — setting a new date replaces the old one, rather than
+    maintaining a full calendar of past and future meetings.
+    """
+    __tablename__ = "tumor_board_meetings"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    meeting_date = Column(Date, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class Task(Base):
