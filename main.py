@@ -340,8 +340,13 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
     if not case:
         raise HTTPException(404, "Case not found")
 
-    required_fields = db.query(DataFieldDefinition).filter_by(
-        disease_profile_id=case.disease_profile_id, required_for_readiness=True
+    # ALL fields for this disease profile show up on the checklist —
+    # not just the ones required for readiness. A field like "Date of
+    # Surgery" is genuinely tracked information even though it
+    # shouldn't count against (or be excluded from) a case that hasn't
+    # reached treatment yet.
+    all_fields = db.query(DataFieldDefinition).filter_by(
+        disease_profile_id=case.disease_profile_id
     ).all()
 
     values_by_field = {
@@ -350,17 +355,15 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
     }
 
     checklist = []
-    complete_count = 0
-    for field in required_fields:
+    for field in all_fields:
         val = values_by_field.get(field.id)
         status = val.status if val else "missing"
-        if status == "complete":
-            complete_count += 1
         checklist.append({
             "key": field.key,
             "field": field.label,
             "category": field.category,
             "status": status,
+            "required": field.required_for_readiness,
             "value": val.value if val else None,
             "source": val.source if val else None,
             "measurement_method": val.measurement_method if val else None,
@@ -370,8 +373,14 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
             "apical_height_mm": val.apical_height_mm if val else None,
         })
 
-    pct = round((complete_count / len(required_fields)) * 100) if required_fields else 0
-    missing = [c["field"] for c in checklist if c["status"] != "complete"]
+    # Percentage and "missing" are only ever based on REQUIRED fields —
+    # an optional field like Date of Surgery being empty should never
+    # count against readiness or show up as something blocking tumor
+    # board presentation.
+    required_items = [c for c in checklist if c["required"]]
+    complete_count = sum(1 for c in required_items if c["status"] == "complete")
+    pct = round((complete_count / len(required_items)) * 100) if required_items else 0
+    missing = [c["field"] for c in required_items if c["status"] != "complete"]
 
     return {
         "case_id": case_id,
