@@ -328,21 +328,16 @@ def delete_value(case_id: str, field_key: str, current_user: User = Depends(get_
     return {"ok": True, "field": field_def.label, "deleted": True}
 
 
-@app.get("/cases/{case_id}/readiness")
-def get_readiness(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def _build_readiness_checklist(case: Case, db: Session):
     """
-    This is the generalized version of your 'Case Readiness: 82%' screen.
-    It works for ANY disease profile — it just reads whatever fields that
+    Shared by the readiness endpoint and the case packet endpoint, so
+    the two never disagree about what's complete, what's missing, or
+    what the overall percentage is.
+
+    Works for ANY disease profile — it just reads whatever fields that
     profile marked as required_for_readiness and checks their status.
-
-    Each checklist item also includes 'value' and 'source' (e.g. a
-    technician's name) when available, so screens like Imaging can show
-    real recorded details, not just a complete/missing badge.
+    Returns (checklist, pct, ready_for_review, missing_field_labels).
     """
-    case = db.query(Case).filter_by(id=case_id).first()
-    if not case:
-        raise HTTPException(404, "Case not found")
-
     # ALL fields for this disease profile show up on the checklist —
     # not just the ones required for readiness. A field like "Date of
     # Surgery" is genuinely tracked information even though it
@@ -354,7 +349,7 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
 
     values_by_field = {
         v.field_definition_id: v
-        for v in db.query(DataValue).filter_by(case_id=case_id).all()
+        for v in db.query(DataValue).filter_by(case_id=case.id).all()
     }
 
     checklist = []
@@ -385,12 +380,159 @@ def get_readiness(case_id: str, current_user: User = Depends(get_current_user), 
     pct = round((complete_count / len(required_items)) * 100) if required_items else 0
     missing = [c["field"] for c in required_items if c["status"] != "complete"]
 
+    return checklist, pct, pct == 100, missing
+
+
+def _latest_measurement_and_trend(case_id: str, db: Session):
+    """
+    Finds the most recently recorded measurement-category value for a
+    case, and the growth/shrinkage trend for that SAME field specifically
+    (scoped by field_key, not mixed across different measurement fields
+    on the same case, in case a disease profile ever defines more than
+    one). Returns (latest_datavalue_or_None, trend_or_None).
+    """
+    latest = (
+        db.query(DataValue)
+        .join(DataFieldDefinition, DataValue.field_definition_id == DataFieldDefinition.id)
+        .filter(
+            DataValue.case_id == case_id,
+            DataFieldDefinition.category == "measurement",
+            DataValue.value.isnot(None),
+        )
+        .order_by(DataValue.recorded_at.desc())
+        .first()
+    )
+    if not latest:
+        return None, None
+
+    field_key = latest.field_definition.key
+    recent_history = (
+        db.query(MeasurementHistory)
+        .filter_by(case_id=case_id, field_key=field_key)
+        .order_by(MeasurementHistory.recorded_at.desc())
+        .limit(2)
+        .all()
+    )
+    trend = None
+    if (
+        len(recent_history) == 2
+        and recent_history[0].basal_diameter_mm is not None
+        and recent_history[1].basal_diameter_mm is not None
+    ):
+        diff = recent_history[0].basal_diameter_mm - recent_history[1].basal_diameter_mm
+        if abs(diff) < 0.1:
+            trend = "stable"
+        else:
+            trend = "growing" if diff > 0 else "shrinking"
+
+    return latest, trend
+
+
+@app.get("/cases/{case_id}/readiness")
+def get_readiness(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    This is the generalized version of your 'Case Readiness: 82%' screen.
+    It works for ANY disease profile — it just reads whatever fields that
+    profile marked as required_for_readiness and checks their status.
+
+    Each checklist item also includes 'value' and 'source' (e.g. a
+    technician's name) when available, so screens like Imaging can show
+    real recorded details, not just a complete/missing badge.
+    """
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    checklist, pct, ready, missing = _build_readiness_checklist(case, db)
+
     return {
         "case_id": case_id,
         "readiness_pct": pct,
-        "ready_for_review": pct == 100,
+        "ready_for_review": ready,
         "checklist": checklist,
         "missing_information": missing,
+    }
+
+
+@app.get("/cases/{case_id}/packet")
+def get_case_packet(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Assembles everything a clinician currently has to gather by hand
+    before presenting a case — current measurement and its trend, one
+    representative image per imaging study, readiness status, and the
+    recorded treatment/follow-up plan — into a single response the
+    frontend renders as one printable page.
+
+    This replaces manual curation, not clinical judgment: "key image"
+    here just means the first slice of each study that has one (the
+    same image already used as that study's thumbnail elsewhere in the
+    app), not an automated read of image content. The clinician still
+    decides what matters; the platform just stops making them
+    re-assemble it from six different screens every time.
+    """
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    checklist, pct, ready, missing = _build_readiness_checklist(case, db)
+    latest_measurement, trend = _latest_measurement_and_trend(case_id, db)
+    decision = db.query(Decision).filter_by(case_id=case_id).first()
+
+    field_labels = {
+        f.key: f.label
+        for f in db.query(DataFieldDefinition).filter_by(disease_profile_id=case.disease_profile_id).all()
+    }
+    field_keys_with_images = [
+        row[0] for row in db.query(ImageUpload.field_key).filter_by(case_id=case_id).distinct().all()
+    ]
+    key_images = []
+    for fk in sorted(field_keys_with_images):
+        first_image = _study_images(db, case_id, fk).first()
+        if not first_image:
+            continue
+        total = db.query(func.count(ImageUpload.id)).filter_by(case_id=case_id, field_key=fk).scalar() or 0
+        key_images.append({
+            "field_key": fk,
+            "field_label": field_labels.get(fk, fk),
+            "image_id": first_image.id,
+            "filename": first_image.filename,
+            "total_in_study": total,
+        })
+
+    return {
+        "case_id": case.id,
+        "patient_name": case.patient.name,
+        "mrn": case.patient.mrn,
+        "dob": case.patient.dob.isoformat() if case.patient.dob else None,
+        "laterality": case.patient.laterality,
+        "diagnosis": case.patient.diagnosis,
+        "disease_profile": case.disease_profile.display_name,
+        "care_stage": case.care_stage,
+        "generated_at": dt.datetime.utcnow().isoformat(),
+        "readiness_pct": pct,
+        "ready_for_review": ready,
+        "missing_information": missing,
+        "checklist": checklist,
+        "measurement": {
+            "value": latest_measurement.value,
+            "method": latest_measurement.measurement_method,
+            "precision": latest_measurement.measurement_precision,
+            "length_type": latest_measurement.measurement_length_type,
+            "basal_diameter_mm": latest_measurement.basal_diameter_mm,
+            "apical_height_mm": latest_measurement.apical_height_mm,
+            "recorded_at": latest_measurement.recorded_at.isoformat() if latest_measurement.recorded_at else None,
+            "trend": trend,
+        } if latest_measurement else None,
+        "decision": {
+            "recommendation": decision.recommendation,
+            "rationale": decision.rationale,
+            "next_step": decision.next_step,
+            "responsible_provider": decision.responsible_provider,
+            "follow_up_date": decision.follow_up_date.isoformat() if decision.follow_up_date else None,
+            "surveillance_protocol": decision.surveillance_protocol,
+            "recorded_at": decision.recorded_at.isoformat() if decision.recorded_at else None,
+        } if decision else None,
+        "key_images": key_images,
     }
 
 
@@ -410,12 +552,48 @@ def compute_readiness_pct(case: Case, db: Session) -> int:
     return round((complete_count / len(required_fields)) * 100)
 
 
+def compute_category_pct(case: Case, db: Session, category: str):
+    """
+    Same idea as compute_readiness_pct, but scoped to one field category
+    (e.g. "imaging") instead of the whole checklist. This is what lets a
+    population view show "imaging complete" separately from overall case
+    readiness — a clinician scanning many patients cares specifically
+    about which ones still need images, not just an overall percentage
+    that also mixes in molecular results, consults, etc.
+
+    Returns None (not 0) when this disease profile defines no required
+    fields in that category at all, so the caller can omit the column
+    instead of showing a misleading 0%.
+    """
+    required_fields = db.query(DataFieldDefinition).filter_by(
+        disease_profile_id=case.disease_profile_id, required_for_readiness=True, category=category
+    ).all()
+    if not required_fields:
+        return None
+    complete_ids = {
+        v.field_definition_id
+        for v in db.query(DataValue).filter_by(case_id=case.id, status="complete").all()
+    }
+    complete_count = sum(1 for f in required_fields if f.id in complete_ids)
+    return round((complete_count / len(required_fields)) * 100)
+
+
 @app.get("/cases")
 def list_cases(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Powers the dashboard's patient table. Every row here is computed from
-    real data — no hardcoded percentages — so as fields get resolved
-    elsewhere in the app, this list updates too.
+    Powers the dashboard's population view. Every row here is computed
+    from real data — no hardcoded percentages — so as fields get
+    resolved elsewhere in the app, this list updates too.
+
+    Beyond basic identity and overall readiness, this also surfaces the
+    handful of things that make a *disease-specific* population view
+    genuinely different from a generic EHR patient list: imaging
+    progress on its own, the latest recorded measurement and whether it
+    has grown or shrunk since the last one, and the surveillance/
+    follow-up date from the case's recorded decision (if any) — so a
+    clinician can see, across every patient at once, who's overdue for
+    follow-up or whose tumor is trending the wrong way, without opening
+    each chart individually.
     """
     cases = db.query(Case).all()
     results = []
@@ -427,15 +605,31 @@ def list_cases(current_user: User = Depends(get_current_user), db: Session = Dep
             status = "warning"
         else:
             status = "missing"
+
+        imaging_pct = compute_category_pct(case, db, "imaging")
+
+        # Same helper the case packet uses, so the two never disagree —
+        # scoped to whichever specific measurement field is most recent,
+        # not mixed across different measurement fields on one case.
+        latest_measurement, measurement_trend = _latest_measurement_and_trend(case.id, db)
+
+        decision = db.query(Decision).filter_by(case_id=case.id).first()
+
         results.append({
             "case_id": case.id,
             "patient_name": case.patient.name,
             "mrn": case.patient.mrn,
             "diagnosis": case.patient.diagnosis,
+            "laterality": case.patient.laterality,
             "care_stage": case.care_stage,
             "readiness_pct": pct,
             "status": status,
             "disease_profile_key": case.disease_profile.key,
+            "imaging_pct": imaging_pct,
+            "key_measurement": latest_measurement.value if latest_measurement else None,
+            "measurement_trend": measurement_trend,
+            "follow_up_date": decision.follow_up_date.isoformat() if decision and decision.follow_up_date else None,
+            "surveillance_protocol": decision.surveillance_protocol if decision else None,
         })
     return results
 
