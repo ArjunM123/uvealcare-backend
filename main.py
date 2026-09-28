@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -718,15 +719,32 @@ class ImageUploadIn(BaseModel):
     data_base64: str  # raw base64 payload, no "data:...;base64," prefix
 
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB — generous for a demo photo, small enough to keep this reasonable
+MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB per image — generous for one slice, small enough to keep this reasonable
+
+# A study (e.g. one OCT series) can now hold many images, and every one
+# of them lives in the database as text — so a study needs a ceiling,
+# or a few large series could quietly fill a small hosted database.
+MAX_IMAGES_PER_STUDY = 60
+MAX_STUDY_BASE64_CHARS = 80 * 1024 * 1024  # about 60 MB of real image data (base64 text runs ~33% larger than the raw bytes)
+
+
+def _study_images(db: Session, case_id: str, field_key: str):
+    """Every image in one study, in viewing order. Images uploaded before
+    ordering existed have no position and count as 0."""
+    return (
+        db.query(ImageUpload)
+        .filter_by(case_id=case_id, field_key=field_key)
+        .order_by(func.coalesce(ImageUpload.position, 0), ImageUpload.uploaded_at, ImageUpload.filename)
+    )
 
 
 @app.post("/cases/{case_id}/images")
 def upload_image(case_id: str, payload: ImageUploadIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Stores a real image for one field on one case. Replaces any existing
-    image for that same field — same upsert pattern as recording a
-    regular data value, just for image content instead of text.
+    Adds one image to a study. Images are appended in the order they
+    arrive, so uploading a series file by file, in filename order, keeps
+    the slices in sequence. (This used to replace the study's single
+    image; a real OCT series is many images, so it now adds instead.)
     """
     case = db.query(Case).filter_by(id=case_id).first()
     if not case:
@@ -744,65 +762,108 @@ def upload_image(case_id: str, payload: ImageUploadIn, current_user: User = Depe
     if not payload.content_type.startswith("image/"):
         raise HTTPException(400, "Only image files are accepted.")
 
-    existing = db.query(ImageUpload).filter_by(case_id=case_id, field_key=payload.field_key).first()
-    if existing:
-        existing.filename = payload.filename
-        existing.content_type = payload.content_type
-        existing.data_base64 = payload.data_base64
-    else:
-        db.add(ImageUpload(
-            case_id=case_id,
-            field_key=payload.field_key,
-            filename=payload.filename,
-            content_type=payload.content_type,
-            data_base64=payload.data_base64,
-        ))
+    same_study = (ImageUpload.case_id == case_id) & (ImageUpload.field_key == payload.field_key)
+
+    count = db.query(func.count(ImageUpload.id)).filter(same_study).scalar() or 0
+    if count >= MAX_IMAGES_PER_STUDY:
+        raise HTTPException(400, f"This study already has the maximum of {MAX_IMAGES_PER_STUDY} images.")
+
+    used_chars = db.query(func.coalesce(func.sum(func.length(ImageUpload.data_base64)), 0)).filter(same_study).scalar() or 0
+    if used_chars + len(payload.data_base64) > MAX_STUDY_BASE64_CHARS:
+        raise HTTPException(400, "This study has reached its storage limit (about 60 MB of images).")
+
+    highest = db.query(func.max(func.coalesce(ImageUpload.position, 0))).filter(same_study).scalar()
+    next_position = 0 if count == 0 else (highest or 0) + 1
+
+    img = ImageUpload(
+        case_id=case_id,
+        field_key=payload.field_key,
+        filename=payload.filename,
+        content_type=payload.content_type,
+        data_base64=payload.data_base64,
+        position=next_position,
+    )
+    db.add(img)
     db.commit()
-    return {"ok": True, "field_key": payload.field_key, "filename": payload.filename}
+    return {"ok": True, "id": img.id, "field_key": payload.field_key, "filename": payload.filename, "position": next_position}
 
 
 @app.get("/cases/{case_id}/images")
 def list_images(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lists which fields have a real uploaded image, without sending the
-    (potentially large) image data itself — the frontend uses this to
-    know which studies show a real photo vs. just a text finding."""
-    images = db.query(ImageUpload).filter_by(case_id=case_id).all()
+    """Lists every uploaded image (one entry per image, so a study with a
+    24-slice series appears 24 times), without sending the image data
+    itself. Only the small metadata columns are read from the database —
+    with multi-image studies, loading the full rows just to list them
+    would mean pulling tens of megabytes on every page view."""
+    rows = (
+        db.query(ImageUpload.id, ImageUpload.field_key, ImageUpload.filename, ImageUpload.position, ImageUpload.uploaded_at)
+        .filter(ImageUpload.case_id == case_id)
+        .order_by(ImageUpload.field_key, func.coalesce(ImageUpload.position, 0), ImageUpload.uploaded_at, ImageUpload.filename)
+        .all()
+    )
     return [
-        {"field_key": img.field_key, "filename": img.filename, "uploaded_at": img.uploaded_at.isoformat() if img.uploaded_at else None}
-        for img in images
+        {
+            "id": r.id,
+            "field_key": r.field_key,
+            "filename": r.filename,
+            "position": r.position or 0,
+            "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None,
+        }
+        for r in rows
     ]
 
 
 from fastapi.responses import Response as FastAPIResponse
 
 
+@app.get("/cases/{case_id}/images/by-id/{image_id}")
+def get_image_by_id(case_id: str, image_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Returns the raw bytes of one specific image — this is what the
+    series viewer uses to step through a study slice by slice. Same
+    authentication as everything else; the frontend fetches it with a
+    valid token rather than pointing an <img> tag at a public URL.
+    """
+    import base64
+    img = db.query(ImageUpload).filter_by(id=image_id, case_id=case_id).first()
+    if not img:
+        raise HTTPException(404, "Image not found.")
+    return FastAPIResponse(content=base64.b64decode(img.data_base64), media_type=img.content_type)
+
+
 @app.get("/cases/{case_id}/images/{field_key}")
 def get_image(case_id: str, field_key: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Returns the actual raw image bytes for one field. This stays behind
-    the same authentication as everything else — unlike a plain <img>
-    tag pointed at a public URL, the frontend has to fetch this with a
-    valid token, same as any other protected endpoint.
+    Returns the FIRST image of a study — used for its thumbnail. The
+    rest of a multi-image study is fetched one slice at a time by id.
     """
     import base64
-    img = db.query(ImageUpload).filter_by(case_id=case_id, field_key=field_key).first()
+    img = _study_images(db, case_id, field_key).first()
     if not img:
         raise HTTPException(404, "No image uploaded for this field.")
-    raw = base64.b64decode(img.data_base64)
-    return FastAPIResponse(content=raw, media_type=img.content_type)
+    return FastAPIResponse(content=base64.b64decode(img.data_base64), media_type=img.content_type)
+
+
+@app.delete("/cases/{case_id}/images/by-id/{image_id}")
+def delete_image_by_id(case_id: str, image_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Removes one image from a study — e.g. a wrong or duplicate slice —
+    without touching the rest of the series."""
+    deleted = db.query(ImageUpload).filter_by(id=image_id, case_id=case_id).delete(synchronize_session=False)
+    if not deleted:
+        raise HTTPException(404, "Image not found.")
+    db.commit()
+    return {"ok": True, "id": image_id, "deleted": True}
 
 
 @app.delete("/cases/{case_id}/images/{field_key}")
 def delete_image(case_id: str, field_key: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Removes an uploaded image outright — previously the only option
-    was to overwrite it with a new upload, with no way to just remove a
-    wrong or unwanted image."""
-    img = db.query(ImageUpload).filter_by(case_id=case_id, field_key=field_key).first()
-    if not img:
+    """Removes EVERY image in a study at once. To remove just one slice,
+    use the by-id version above."""
+    deleted = db.query(ImageUpload).filter_by(case_id=case_id, field_key=field_key).delete(synchronize_session=False)
+    if not deleted:
         raise HTTPException(404, "No image uploaded for this field.")
-    db.delete(img)
     db.commit()
-    return {"ok": True, "field_key": field_key, "deleted": True}
+    return {"ok": True, "field_key": field_key, "deleted": deleted}
 
 
 class TumorBoardMeetingIn(BaseModel):

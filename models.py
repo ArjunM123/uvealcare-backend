@@ -210,9 +210,11 @@ class Decision(Base):
 
 class ImageUpload(Base):
     """
-    A real uploaded image (e.g. a B-scan or OCT photo) tied to one
-    specific field on one case — at most one image per field per case;
-    uploading again replaces the previous one, same pattern as DataValue.
+    A real uploaded image (e.g. one slice of a B-scan or OCT series)
+    tied to one specific field (study) on one case. A study can hold
+    many images — real OCT and similar studies are multi-slice volumes
+    that a clinician scrolls through, not a single snapshot — and
+    `position` is the order they're viewed in (0 = first slice).
 
     Stored directly in Postgres as base64 text rather than a separate
     file-storage service. This keeps the whole app on infrastructure
@@ -229,5 +231,10 @@ class ImageUpload(Base):
     content_type = Column(String, nullable=False)
     data_base64 = Column(Text, nullable=False)
     uploaded_at = Column(DateTime, server_default=func.now())
+    # Viewing order within a study. Nullable because images uploaded
+    # before this column existed don't have one — they're treated as
+    # position 0, which is correct since each of them was the only
+    # image in its study.
+    position = Column(Integer, nullable=True)
 
     case = relationship("Case")

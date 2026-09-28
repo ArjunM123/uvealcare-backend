@@ -30,6 +30,7 @@ NEW_COLUMNS = [
     ("tasks", "assignee_id", "VARCHAR"),
     ("data_values", "basal_diameter_mm", "FLOAT"),
     ("data_values", "apical_height_mm", "FLOAT"),
+    ("image_uploads", "position", "INTEGER"),
 ]
 
 
