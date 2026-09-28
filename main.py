@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import func
@@ -9,6 +9,8 @@ import json
 import bcrypt
 import jwt
 import os
+import io
+import base64
 import datetime as dt
 
 from database import get_db, init_db
@@ -738,6 +740,51 @@ def _study_images(db: Session, case_id: str, field_key: str):
     )
 
 
+def _append_image_row(
+    db: Session,
+    case_id: str,
+    field_key: str,
+    filename: str,
+    content_type: str,
+    raw_bytes: bytes,
+    count: int,
+    used_chars: int,
+):
+    """
+    Shared insertion logic behind every way an image gets added to a
+    study — a plain upload and a DICOM/PDF import both end here. Takes
+    the study's current image count and base64-character total so a
+    multi-page import can insert many rows in one request without
+    re-querying the database between each one, and returns the updated
+    running totals so the caller can pass them into the next call.
+    """
+    if len(raw_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(400, f"\"{filename}\" is too large — max {MAX_IMAGE_BYTES // (1024*1024)}MB per image.")
+
+    if count >= MAX_IMAGES_PER_STUDY:
+        raise HTTPException(400, f"This study already has the maximum of {MAX_IMAGES_PER_STUDY} images.")
+
+    data_base64 = base64.b64encode(raw_bytes).decode("ascii")
+    if used_chars + len(data_base64) > MAX_STUDY_BASE64_CHARS:
+        raise HTTPException(400, "This study has reached its storage limit (about 60 MB of images).")
+
+    same_study = (ImageUpload.case_id == case_id) & (ImageUpload.field_key == field_key)
+    highest = db.query(func.max(func.coalesce(ImageUpload.position, 0))).filter(same_study).scalar()
+    next_position = 0 if count == 0 else (highest or 0) + 1
+
+    img = ImageUpload(
+        case_id=case_id,
+        field_key=field_key,
+        filename=filename,
+        content_type=content_type,
+        data_base64=data_base64,
+        position=next_position,
+    )
+    db.add(img)
+    db.flush()  # so the next call's MAX(position) query in this same request sees this row
+    return img, count + 1, used_chars + len(data_base64)
+
+
 @app.post("/cases/{case_id}/images")
 def upload_image(case_id: str, payload: ImageUploadIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -786,6 +833,138 @@ def upload_image(case_id: str, payload: ImageUploadIn, current_user: User = Depe
     db.add(img)
     db.commit()
     return {"ok": True, "id": img.id, "field_key": payload.field_key, "filename": payload.filename, "position": next_position}
+
+
+# A raw DICOM export or a vendor PDF report is usually much smaller than
+# this once converted, but the original file itself (especially an
+# uncompressed multi-frame DICOM) can be large — this caps the upload
+# before any parsing is attempted.
+MAX_IMPORT_FILE_BYTES = 25 * 1024 * 1024  # 25MB
+
+
+@app.post("/cases/{case_id}/images/import")
+async def import_image_file(
+    case_id: str,
+    field_key: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Imports a file straight from a vendor imaging system into a study,
+    instead of requiring a clinician to screenshot or re-photograph a
+    result off another system's screen. Two formats are accepted:
+
+    - A DICOM file (.dcm) exported from a device like a Heidelberg,
+      Optos, or Visage system. Every frame in it (a DICOM file can hold
+      one image or a whole multi-frame series) is converted to a PNG.
+    - A PDF report (many of the same vendor systems export a print-style
+      PDF instead of, or alongside, raw DICOM). Every page is rendered
+      to a PNG.
+
+    Either way, the resulting image(s) are appended to the study through
+    the same position-ordered path as a normal upload, so a multi-frame
+    DICOM or a multi-page PDF shows up as an ordinary multi-slide study
+    in the existing viewer — nothing downstream needs to know it didn't
+    arrive as a plain image.
+    """
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "That file is empty.")
+    if len(raw) > MAX_IMPORT_FILE_BYTES:
+        raise HTTPException(400, f"File too large — max {MAX_IMPORT_FILE_BYTES // (1024*1024)}MB.")
+
+    name = (file.filename or "import").strip()
+    lower = name.lower()
+    base_name = name.rsplit(".", 1)[0] if "." in name else name
+    is_pdf = lower.endswith(".pdf") or file.content_type == "application/pdf"
+
+    pages: list[bytes] = []
+
+    if is_pdf:
+        try:
+            import fitz  # PyMuPDF
+            pdf_doc = fitz.open(stream=raw, filetype="pdf")
+        except Exception:
+            raise HTTPException(400, f"\"{name}\" couldn't be read as a PDF.")
+        if pdf_doc.page_count == 0:
+            pdf_doc.close()
+            raise HTTPException(400, f"\"{name}\" has no pages.")
+        for page in pdf_doc:
+            pix = page.get_pixmap(dpi=150)
+            pages.append(pix.tobytes("png"))
+        pdf_doc.close()
+    else:
+        # Not named or typed as a PDF, so try it as DICOM — a DICOM file
+        # exported straight off a scanner very often has no recognizable
+        # extension or content-type at all, so this is the fallback path
+        # rather than something gated behind a ".dcm" check.
+        try:
+            import numpy as np
+            import pydicom
+            from pydicom.pixels import apply_voi_lut
+            from PIL import Image
+        except ImportError:
+            raise HTTPException(500, "DICOM/PDF import isn't available on this server (missing dependency).")
+
+        try:
+            ds = pydicom.dcmread(io.BytesIO(raw), force=True)
+            arr = ds.pixel_array
+        except Exception:
+            raise HTTPException(400, f"\"{name}\" isn't a .dcm or .pdf file that could be imported.")
+
+        try:
+            windowed = apply_voi_lut(arr, ds)
+        except Exception:
+            windowed = arr
+
+        num_frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+        frames = list(windowed) if (num_frames > 1 and windowed.ndim >= 3) else [windowed]
+
+        for frame in frames:
+            frame = frame.astype("float64")
+            lo, hi = float(frame.min()), float(frame.max())
+            frame = ((frame - lo) / (hi - lo) * 255.0) if hi > lo else (frame * 0)
+            frame = frame.astype("uint8")
+
+            # MONOCHROME1 means the lowest raw values should display
+            # brightest — invert so the PNG looks right instead of like
+            # a photographic negative of the actual scan.
+            if str(getattr(ds, "PhotometricInterpretation", "")) == "MONOCHROME1":
+                frame = 255 - frame
+
+            buf = io.BytesIO()
+            Image.fromarray(frame).save(buf, format="PNG")
+            pages.append(buf.getvalue())
+
+    if not pages:
+        raise HTTPException(400, f"\"{name}\" didn't contain anything importable.")
+
+    same_study = (ImageUpload.case_id == case_id) & (ImageUpload.field_key == field_key)
+    count = db.query(func.count(ImageUpload.id)).filter(same_study).scalar() or 0
+    used_chars = db.query(func.coalesce(func.sum(func.length(ImageUpload.data_base64)), 0)).filter(same_study).scalar() or 0
+
+    if count + len(pages) > MAX_IMAGES_PER_STUDY:
+        raise HTTPException(
+            400,
+            f"\"{name}\" would add {len(pages)} image(s), but a study can hold up to {MAX_IMAGES_PER_STUDY}. "
+            f"This one already has {count} — nothing was imported.",
+        )
+
+    created_ids = []
+    for i, png_bytes in enumerate(pages):
+        label = f"{base_name}.png" if len(pages) == 1 else f"{base_name}_{i + 1}.png"
+        img_row, count, used_chars = _append_image_row(
+            db, case_id, field_key, label, "image/png", png_bytes, count, used_chars
+        )
+        created_ids.append(img_row.id)
+
+    db.commit()
+    return {"ok": True, "field_key": field_key, "imported": len(created_ids), "image_ids": created_ids}
 
 
 @app.get("/cases/{case_id}/images")
