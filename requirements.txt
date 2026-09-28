@@ -6,3 +6,4 @@ bcrypt
 pyjwt
 psycopg2-binary
 python-dotenv
+SQLAlchemy<2.1
