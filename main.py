@@ -454,7 +454,7 @@ TFSOM_FACTOR_LABELS = {
     "tfsom_fluid": "Subretinal fluid",
     "tfsom_symptoms": "Symptoms",
     "tfsom_orange_pigment": "Orange pigment",
-    "tfsom_margin": "Margin \u22643mm to disc",
+    "tfsom_margin": "Margin ≤3mm to disc",
     "tfsom_ultrasound_hollow": "Ultrasonographic hollowness",
     "tfsom_no_halo": "Halo absent",
     "tfsom_no_drusen": "Drusen absent",
@@ -513,6 +513,76 @@ def get_tfsom_risk(case_id: str, current_user: User = Depends(get_current_user),
     if not case:
         raise HTTPException(404, "Case not found")
     return {"case_id": case_id, "tfsom_risk": _compute_tfsom_risk(case_id, db)}
+
+
+# Gene expression profiling (DecisionDx-UM is the test in near-universal
+# use) classifies a tumor's METASTATIC risk — a completely different axis
+# from TFSOM (which estimates a NEVUS's risk of becoming melanoma in the
+# first place). AJCC now recommends GEP testing for essentially all uveal
+# melanoma patients. Class 1A = low risk, Class 1B = intermediate/
+# long-term risk, Class 2 = high, near-term risk. This mapping is the
+# test's own published classification, not a derived clinical judgment —
+# unlike surveillance-interval recommendations (which vary by center and
+# aren't hardcoded here).
+GEP_RISK_LABELS = {
+    "1a": "Low",
+    "1b": "Intermediate",
+    "2": "High",
+}
+
+
+def _compute_gep_risk(case_id: str, db: Session):
+    """
+    Reads the recorded GEP class (if any) for this case and maps it to
+    its published metastatic-risk tier. Returns None if GEP hasn't been
+    recorded yet — most cases won't have this until tissue is obtained,
+    so an absent result is the normal state, not a gap to flag the way
+    missing imaging is.
+    """
+    gep_value = (
+        db.query(DataValue)
+        .join(DataFieldDefinition, DataValue.field_definition_id == DataFieldDefinition.id)
+        .filter(
+            DataValue.case_id == case_id,
+            DataFieldDefinition.key == "gep_class",
+            DataValue.status == "complete",
+        )
+        .first()
+    )
+    if not gep_value or not gep_value.value:
+        return None
+
+    raw = gep_value.value.strip()
+    normalized = raw.lower().replace(" ", "").replace("class", "")
+    risk_label = GEP_RISK_LABELS.get(normalized)
+
+    chr3_value = (
+        db.query(DataValue)
+        .join(DataFieldDefinition, DataValue.field_definition_id == DataFieldDefinition.id)
+        .filter(
+            DataValue.case_id == case_id,
+            DataFieldDefinition.key == "chromosome_3_status",
+            DataValue.status == "complete",
+        )
+        .first()
+    )
+
+    return {
+        "gep_class": raw,
+        "risk_label": risk_label,  # None if the recorded value doesn't match a known class
+        "chromosome_3_status": chr3_value.value if chr3_value else None,
+        "test_name": "DecisionDx-UM",
+    }
+
+
+@app.get("/cases/{case_id}/gep-risk")
+def get_gep_risk(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Standalone fetch of the recorded GEP/molecular result, so a screen
+    can show the metastatic-risk badge without pulling the whole packet."""
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    return {"case_id": case_id, "gep_risk": _compute_gep_risk(case_id, db)}
 
 
 @app.get("/cases/{case_id}/readiness")
@@ -621,6 +691,7 @@ def get_case_packet(case_id: str, current_user: User = Depends(get_current_user)
         } if decision else None,
         "key_images": key_images,
         "tfsom_risk": _compute_tfsom_risk(case_id, db),
+        "gep_risk": _compute_gep_risk(case_id, db),
     }
 
 
@@ -710,6 +781,11 @@ def list_cases(current_user: User = Depends(get_current_user), db: Session = Dep
         # melanoma diagnosis, visible without opening each chart.
         tfsom_risk = _compute_tfsom_risk(case.id, db) if case.disease_profile.key == "uveal_melanoma" else None
 
+        # GEP class is a different axis from TFSOM — metastatic risk of an
+        # already-diagnosed melanoma, not a nevus's risk of becoming one —
+        # so it's surfaced as its own population-view flag.
+        gep_risk = _compute_gep_risk(case.id, db) if case.disease_profile.key == "uveal_melanoma" else None
+
         results.append({
             "case_id": case.id,
             "patient_name": case.patient.name,
@@ -726,6 +802,7 @@ def list_cases(current_user: User = Depends(get_current_user), db: Session = Dep
             "follow_up_date": decision.follow_up_date.isoformat() if decision and decision.follow_up_date else None,
             "surveillance_protocol": decision.surveillance_protocol if decision else None,
             "tfsom_risk_label": tfsom_risk["risk_label"] if tfsom_risk else None,
+            "gep_risk_label": gep_risk["risk_label"] if gep_risk else None,
         })
     return results
 
