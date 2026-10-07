@@ -1209,6 +1209,92 @@ def upload_image(case_id: str, payload: ImageUploadIn, current_user: User = Depe
 MAX_IMPORT_FILE_BYTES = 25 * 1024 * 1024  # 25MB
 
 
+def _dicom_to_png_pages(ds, arr):
+    """
+    Converts a decoded DICOM pixel array into a list of 8-bit PNGs (one per
+    frame) without changing how the image looks:
+      - colour stays colour (YBR is converted to RGB when the data is stored
+        uncompressed)
+      - 8-bit grey images pass through unchanged
+      - anything deeper than 8 bits is mapped to 8 bits with ONE scale shared
+        by every frame in the file, after the DICOM rescale and window are
+        applied, so brightness is comparable from slice to slice
+    """
+    import numpy as np
+    from PIL import Image
+
+    photometric = str(getattr(ds, "PhotometricInterpretation", ""))
+    samples = int(getattr(ds, "SamplesPerPixel", 1) or 1)
+    num_frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+
+    def to_png(frame_u8):
+        buf = io.BytesIO()
+        Image.fromarray(frame_u8).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def shared_scale_to_u8(stack):
+        stack = np.asarray(stack, dtype="float64")
+        lo, hi = float(stack.min()), float(stack.max())
+        if hi <= lo:
+            return np.zeros(stack.shape, dtype="uint8")
+        return ((stack - lo) / (hi - lo) * 255.0).round().astype("uint8")
+
+    # ---- colour ----
+    if samples >= 3:
+        data = np.asarray(arr)
+        if photometric.startswith("YBR"):
+            try:
+                compressed = bool(ds.file_meta.TransferSyntaxUID.is_compressed)
+            except Exception:
+                compressed = True  # the decoder has already returned RGB
+            if not compressed:
+                try:
+                    from pydicom.pixels import convert_color_space
+                except ImportError:
+                    from pydicom.pixel_data_handlers.util import convert_color_space
+                data = convert_color_space(data, photometric, "RGB")
+        frames = list(data) if (num_frames > 1 and data.ndim == 4) else [data]
+        if data.dtype != np.uint8:
+            scaled = shared_scale_to_u8(np.stack(frames))
+            frames = list(scaled)
+        return [to_png(f[..., :3]) for f in frames]
+
+    # ---- grey ----
+    data = np.asarray(arr)
+    try:
+        try:
+            from pydicom.pixels import apply_modality_lut
+        except ImportError:
+            from pydicom.pixel_data_handlers.util import apply_modality_lut
+        data = apply_modality_lut(data, ds)
+    except Exception:
+        pass
+
+    has_window = hasattr(ds, "WindowCenter") or hasattr(ds, "VOILUTSequence")
+    if has_window:
+        try:
+            try:
+                from pydicom.pixels import apply_voi_lut
+            except ImportError:
+                from pydicom.pixel_data_handlers.util import apply_voi_lut
+            data = apply_voi_lut(data, ds)
+        except Exception:
+            has_window = False
+
+    data = np.asarray(data)
+    if data.dtype == np.uint8 and not has_window:
+        u8 = data
+    else:
+        u8 = shared_scale_to_u8(data)
+
+    # MONOCHROME1 means the lowest raw values should display brightest.
+    if photometric == "MONOCHROME1":
+        u8 = 255 - u8
+
+    frames = list(u8) if (num_frames > 1 and u8.ndim >= 3) else [u8]
+    return [to_png(f) for f in frames]
+
+
 @app.post("/cases/{case_id}/images/import")
 async def import_image_file(
     case_id: str,
@@ -1262,7 +1348,7 @@ async def import_image_file(
             pdf_doc.close()
             raise HTTPException(400, f"\"{name}\" has no pages.")
         for page in pdf_doc:
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=200)
             pages.append(pix.tobytes("png"))
         pdf_doc.close()
     else:
@@ -1285,28 +1371,9 @@ async def import_image_file(
             raise HTTPException(400, f"\"{name}\" isn't a .dcm or .pdf file that could be imported.")
 
         try:
-            windowed = apply_voi_lut(arr, ds)
+            pages.extend(_dicom_to_png_pages(ds, arr))
         except Exception:
-            windowed = arr
-
-        num_frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
-        frames = list(windowed) if (num_frames > 1 and windowed.ndim >= 3) else [windowed]
-
-        for frame in frames:
-            frame = frame.astype("float64")
-            lo, hi = float(frame.min()), float(frame.max())
-            frame = ((frame - lo) / (hi - lo) * 255.0) if hi > lo else (frame * 0)
-            frame = frame.astype("uint8")
-
-            # MONOCHROME1 means the lowest raw values should display
-            # brightest — invert so the PNG looks right instead of like
-            # a photographic negative of the actual scan.
-            if str(getattr(ds, "PhotometricInterpretation", "")) == "MONOCHROME1":
-                frame = 255 - frame
-
-            buf = io.BytesIO()
-            Image.fromarray(frame).save(buf, format="PNG")
-            pages.append(buf.getvalue())
+            raise HTTPException(400, f"\"{name}\" was read as DICOM but its image data couldn't be converted.")
 
     if not pages:
         raise HTTPException(400, f"\"{name}\" didn't contain anything importable.")
