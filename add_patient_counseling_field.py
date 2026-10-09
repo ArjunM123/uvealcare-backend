@@ -15,7 +15,7 @@ Run with:  python3 add_patient_counseling_field.py
 """
 
 from database import SessionLocal
-from models import DiseaseProfile, DataFieldDefinition
+from models import DiseaseProfile, DataFieldfDefinition
 
 db = SessionLocal()
 

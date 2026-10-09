@@ -12,3 +12,7 @@ pydicom
 PyMuPDF
 numpy
 Pillow
+
+pylibjpeg
+pylibjpeg-libjpeg
+pylibjpeg-openjpeg

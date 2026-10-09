@@ -12,6 +12,7 @@ import os
 import io
 import base64
 import datetime as dt
+import molecular_risk
 import patient_journey
 
 from database import get_db, init_db
@@ -143,6 +144,9 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     if len(payload.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
 
+    if (payload.role or "").strip().lower() == "admin":
+        payload.role = "clinician"  # only an administrator can grant admin
+
     hashed = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
     user = User(
         name=payload.name,
@@ -252,6 +256,7 @@ def record_value(case_id: str, payload: DataValueIn, current_user: User = Depend
     ).first()
     if not field_def:
         raise HTTPException(400, f"Unknown field '{payload.field_key}' for this disease profile")
+    _enforce_field_write(current_user, field_def)
 
     existing = db.query(DataValue).filter_by(
         case_id=case_id, field_definition_id=field_def.id
@@ -317,6 +322,7 @@ def delete_value(case_id: str, field_key: str, current_user: User = Depends(get_
     ).first()
     if not field_def:
         raise HTTPException(404, "Unknown field for this disease profile")
+    _enforce_field_write(current_user, field_def)
 
     existing = db.query(DataValue).filter_by(
         case_id=case_id, field_definition_id=field_def.id
@@ -692,6 +698,8 @@ def get_case_packet(case_id: str, current_user: User = Depends(get_current_user)
         } if decision else None,
         "key_images": key_images,
         "tfsom_risk": _compute_tfsom_risk(case_id, db),
+        "tfsom_dim": _compute_tfsom_dim(case_id, db),
+        "molecular_profile": _compute_molecular_profile(case_id, db),
         "gep_risk": _compute_gep_risk(case_id, db),
     }
 
@@ -756,6 +764,7 @@ def list_cases(current_user: User = Depends(get_current_user), db: Session = Dep
     each chart individually.
     """
     cases = db.query(Case).all()
+    cases = _visible_cases(cases, current_user, db)
     results = []
     for case in cases:
         pct = compute_readiness_pct(case, db)
@@ -903,6 +912,427 @@ def set_patient_journey_release(case_id: str, payload: JourneyReleaseIn, current
                          value=text, status="complete", source=current_user.name))
     db.commit()
     return {"ok": True, "case_id": case_id, "released": payload.released}
+
+
+# uvealcare: molecular biomarkers
+# TFSOM-DIM and the molecular profile (see molecular_risk.py for the rules and
+# their sources). The 12 new yes/no fields are created automatically at start-up
+# if they are missing, so no separate migration step is needed.
+def _ensure_molecular_fields():
+    from database import SessionLocal
+    s = SessionLocal()
+    try:
+        profile = s.query(DiseaseProfile).filter_by(key="uveal_melanoma").first()
+        if not profile:
+            return
+        existing = {
+            k for (k,) in s.query(DataFieldDefinition.key).filter_by(disease_profile_id=profile.id).all()
+        }
+        added = 0
+        for key, label, category in molecular_risk.NEW_FIELDS:
+            if key in existing:
+                continue
+            s.add(DataFieldDefinition(
+                disease_profile_id=profile.id, key=key, label=label,
+                category=category, data_type="boolean", required_for_readiness=False,
+            ))
+            added += 1
+        if added:
+            s.commit()
+            print("molecular biomarkers: added %d field(s)" % added)
+    except Exception as exc:  # never stop the server from starting over this
+        s.rollback()
+        print("molecular biomarkers: could not add fields:", exc)
+    finally:
+        s.close()
+
+
+_ensure_molecular_fields()
+
+
+def _molecular_values(case_id: str, db: Session):
+    rows = (
+        db.query(DataValue, DataFieldDefinition.key)
+        .join(DataFieldDefinition, DataValue.field_definition_id == DataFieldDefinition.id)
+        .filter(DataValue.case_id == case_id, DataValue.status == "complete")
+        .all()
+    )
+    return {key: dv.value.strip() for dv, key in rows if dv.value and dv.value.strip()}
+
+
+def _is_uveal(case_id: str, db: Session):
+    case = db.query(Case).filter_by(id=case_id).first()
+    return bool(case and case.disease_profile.key == "uveal_melanoma")
+
+
+def _compute_tfsom_dim(case_id: str, db: Session):
+    if not _is_uveal(case_id, db):
+        return None
+    return molecular_risk.compute_tfsom_dim(_molecular_values(case_id, db))
+
+
+def _compute_molecular_profile(case_id: str, db: Session):
+    if not _is_uveal(case_id, db):
+        return None
+    return molecular_risk.compute_molecular_profile(_molecular_values(case_id, db))
+
+
+@app.get("/cases/{case_id}/molecular-profile")
+def get_molecular_profile(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    return {
+        "case_id": case_id,
+        "tfsom_dim": _compute_tfsom_dim(case_id, db),
+        "molecular_profile": _compute_molecular_profile(case_id, db),
+    }
+
+
+# uvealcare: roles and care teams
+# Rules live in roles.py; tables in roles_db.py. One guard (the middleware
+# below) sees every request, so a specialist cannot reach a case they are not
+# on even through an endpoint added later.
+import roles
+import roles_db
+from fastapi import Request
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import JSONResponse as _JSONResponse
+from models import Base as _RolesBase
+from database import SessionLocal as _RolesSession, engine as _roles_engine
+
+_RolesBase.metadata.create_all(bind=_roles_engine)
+
+# Accounts listed here are administrators. Set ADMIN_EMAILS on Render
+# (comma-separated) to change it. The default keeps the demo account in charge.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", "a.reyes@uvealcare.org").split(",")
+    if e.strip()
+}
+
+
+def _is_admin(user) -> bool:
+    return (user.role or "").strip().lower() == "admin" or (user.email or "").strip().lower() in ADMIN_EMAILS
+
+
+def _role_of(user) -> str:
+    return "admin" if _is_admin(user) else (user.role or "")
+
+
+def _iso(dtval):
+    return (dtval.isoformat() + "Z") if dtval else None
+
+
+def _guard_decision(auth_header, method, path):
+    # Returns (user_dict_or_None, reason_to_block_or_None). Runs in a thread.
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return None, None
+    try:
+        payload = jwt.decode(auth_header[7:].strip(), JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return None, None  # the endpoint itself will answer 401
+    s = _RolesSession()
+    try:
+        u = s.query(User).filter_by(id=payload.get("sub")).first()
+        if not u:
+            return None, None
+        info = {"id": u.id, "name": u.name, "role": _role_of(u)}
+
+        def on_team(case_id):
+            return s.query(roles_db.CareTeamMember.id).filter_by(case_id=case_id, user_id=u.id).first() is not None
+
+        return info, roles.check_request(info["role"], method, path, on_team)
+    except Exception as exc:  # never lock everyone out because of a bug here
+        print("roles guard error:", exc)
+        return None, None
+    finally:
+        s.close()
+
+
+def _write_audit(user, method, path, status, detail):
+    action = roles.audit_action(method, path)
+    if status == 403:
+        action = "blocked: " + (action or ("%s %s" % (method.lower(), path)))
+    if not action:
+        return
+    parsed = roles.parse_case_path(path)
+    s = _RolesSession()
+    try:
+        s.add(roles_db.AuditEntry(
+            user_id=user["id"], user_name=user["name"], role=user["role"],
+            action=action, method=method, path=path[:300],
+            case_id=parsed[0] if parsed else None, status_code=status, detail=detail,
+        ))
+        s.commit()
+    except Exception as exc:
+        s.rollback()
+        print("audit log error:", exc)
+    finally:
+        s.close()
+
+
+@app.middleware("http")
+async def _roles_guard(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    user, deny = await run_in_threadpool(
+        _guard_decision, request.headers.get("authorization"), request.method, request.url.path
+    )
+    if deny:
+        await run_in_threadpool(_write_audit, user, request.method, request.url.path, 403, deny)
+        return _JSONResponse({"detail": deny}, status_code=403, headers={"Access-Control-Allow-Origin": "*"})
+    response = await call_next(request)
+    if user:
+        await run_in_threadpool(
+            _write_audit, user, request.method, request.url.path, response.status_code,
+            getattr(request.state, "audit_detail", None),
+        )
+    return response
+
+
+def _team_case_ids(user, db):
+    return {m.case_id for m in db.query(roles_db.CareTeamMember).filter_by(user_id=user.id).all()}
+
+
+def _visible_cases(cases, user, db):
+    if not roles.is_restricted(_role_of(user)):
+        return cases
+    ids = _team_case_ids(user, db)
+    return [c for c in cases if c.id in ids]
+
+
+def _visible_tasks(tasks, user, db):
+    if not roles.is_restricted(_role_of(user)):
+        return tasks
+    ids = _team_case_ids(user, db)
+    return [t for t in tasks if t.case_id in ids or t.assignee_id == user.id]
+
+
+def _enforce_field_write(user, field_def):
+    if not roles.can_write_category(_role_of(user), field_def.category):
+        raise HTTPException(
+            403,
+            "Your role (%s) can't edit %s fields. Ask the ocular oncologist, or send a consult request."
+            % (roles.label(_role_of(user)), field_def.category.replace("_", " ")),
+        )
+
+
+def _require_admin(user):
+    if not _is_admin(user):
+        raise HTTPException(403, "Only an administrator can do that.")
+
+
+def _case_or_404(case_id, db):
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    return case
+
+
+@app.get("/me/permissions")
+def my_permissions(current_user: User = Depends(get_current_user)):
+    return roles.permissions_summary(current_user.role, _is_admin(current_user))
+
+
+@app.get("/roles")
+def list_roles(current_user: User = Depends(get_current_user)):
+    return {
+        "roles": [{"key": k, "label": v["label"], "summary": v["summary"]} for k, v in roles.ROLE_INFO.items()],
+        "consult_roles": roles.CONSULT_ROLES,
+    }
+
+
+@app.get("/admin/users")
+def admin_list_users(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(current_user)
+    out = []
+    for u in db.query(User).order_by(User.name).all():
+        n = db.query(func.count(roles_db.CareTeamMember.id)).filter_by(user_id=u.id).scalar() or 0
+        out.append({
+            "id": u.id, "name": u.name, "email": u.email, "role": u.role,
+            "label": roles.label(u.role), "is_admin": _is_admin(u),
+            "restricted": roles.is_restricted(_role_of(u)), "case_count": n,
+        })
+    return out
+
+
+class RoleChangeIn(BaseModel):
+    role: str
+
+
+@app.put("/users/{user_id}/role")
+def change_user_role(user_id: str, payload: RoleChangeIn, request: Request,
+                     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(current_user)
+    if payload.role not in roles.ASSIGNABLE_ROLES:
+        raise HTTPException(400, "Unknown role.")
+    target = db.query(User).filter_by(id=user_id).first()
+    if not target:
+        raise HTTPException(404, "User not found")
+    old = target.role
+    target.role = payload.role
+    db.commit()
+    request.state.audit_detail = "Changed %s from %s to %s" % (target.name, roles.label(old), roles.label(payload.role))
+    return {"ok": True, "id": target.id, "role": target.role, "label": roles.label(target.role)}
+
+
+@app.post("/users/{user_id}/team-all")
+def add_user_to_all_cases(user_id: str, request: Request,
+                          current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(current_user)
+    target = db.query(User).filter_by(id=user_id).first()
+    if not target:
+        raise HTTPException(404, "User not found")
+    have = {m.case_id for m in db.query(roles_db.CareTeamMember).filter_by(user_id=user_id).all()}
+    added = 0
+    for c in db.query(Case).all():
+        if c.id not in have:
+            db.add(roles_db.CareTeamMember(case_id=c.id, user_id=user_id,
+                                           team_role=roles.normalize(target.role), added_by=current_user.name))
+            added += 1
+    db.commit()
+    request.state.audit_detail = "Added %s to %d case(s)" % (target.name, added)
+    return {"ok": True, "added": added}
+
+
+def _team_payload(case_id, db):
+    rows = db.query(roles_db.CareTeamMember).filter_by(case_id=case_id).all()
+    users = {u.id: u for u in db.query(User).filter(User.id.in_([r.user_id for r in rows] or [""])).all()}
+    members = []
+    for r in rows:
+        u = users.get(r.user_id)
+        if not u:
+            continue
+        members.append({
+            "user_id": r.user_id, "name": u.name, "team_role": r.team_role,
+            "label": roles.label(r.team_role), "added_by": r.added_by, "added_at": _iso(r.created_at),
+        })
+    members.sort(key=lambda m: (m["label"], m["name"]))
+    return members
+
+
+@app.get("/cases/{case_id}/team")
+def get_case_team(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _case_or_404(case_id, db)
+    return {"members": _team_payload(case_id, db),
+            "can_manage": roles.can_manage_team(_role_of(current_user))}
+
+
+class TeamAddIn(BaseModel):
+    user_id: str
+    team_role: Optional[str] = None
+
+
+@app.post("/cases/{case_id}/team")
+def add_team_member(case_id: str, payload: TeamAddIn, request: Request,
+                    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _case_or_404(case_id, db)
+    target = db.query(User).filter_by(id=payload.user_id).first()
+    if not target:
+        raise HTTPException(404, "User not found")
+    team_role = roles.normalize(payload.team_role or target.role)
+    if team_role not in roles.ROLE_INFO:
+        team_role = roles.normalize(target.role)
+    row = db.query(roles_db.CareTeamMember).filter_by(case_id=case_id, user_id=target.id).first()
+    if row:
+        row.team_role = team_role
+    else:
+        db.add(roles_db.CareTeamMember(case_id=case_id, user_id=target.id, team_role=team_role,
+                                       added_by=current_user.name))
+    db.commit()
+    request.state.audit_detail = "Added %s to the care team as %s" % (target.name, roles.label(team_role))
+    return {"ok": True, "members": _team_payload(case_id, db)}
+
+
+@app.delete("/cases/{case_id}/team/{user_id}")
+def remove_team_member(case_id: str, user_id: str, request: Request,
+                       current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _case_or_404(case_id, db)
+    row = db.query(roles_db.CareTeamMember).filter_by(case_id=case_id, user_id=user_id).first()
+    if not row:
+        raise HTTPException(404, "That person isn't on this case's team.")
+    u = db.query(User).filter_by(id=user_id).first()
+    db.delete(row)
+    db.commit()
+    request.state.audit_detail = "Removed %s from the care team" % (u.name if u else user_id)
+    return {"ok": True, "members": _team_payload(case_id, db)}
+
+
+class ConsultIn(BaseModel):
+    to_role: str
+    note: Optional[str] = None
+
+
+@app.post("/cases/{case_id}/consult-request")
+def request_consult(case_id: str, payload: ConsultIn, request: Request,
+                    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _case_or_404(case_id, db)
+    to_role = roles.normalize(payload.to_role)
+    if to_role not in roles.CONSULT_ROLES:
+        raise HTTPException(400, "Choose ocular, radiation or systemic oncology.")
+    team = db.query(roles_db.CareTeamMember).filter_by(case_id=case_id, team_role=to_role).first()
+    assignee = db.query(User).filter_by(id=team.user_id).first() if team else None
+    note = (payload.note or "").strip()
+    desc = "%s review requested by %s" % (roles.label(to_role), current_user.name)
+    if note:
+        desc += ": " + note[:500]
+    if not assignee:
+        desc += " (no one with this role is on the care team yet)"
+    task = Task(case_id=case_id, assignee_id=assignee.id if assignee else None,
+                assignee_name=None if assignee else roles.label(to_role), description=desc, status="open")
+    db.add(task)
+    db.commit()
+    request.state.audit_detail = "Requested %s review" % roles.label(to_role)
+    return {"ok": True, "task_id": task.id, "assigned_to": assignee.name if assignee else None}
+
+
+@app.get("/cases/{case_id}/signoffs")
+def list_signoffs(case_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _case_or_404(case_id, db)
+    rows = db.query(roles_db.CaseSignoff).filter_by(case_id=case_id).order_by(roles_db.CaseSignoff.at.desc()).all()
+    latest = {}
+    for r in rows:
+        latest.setdefault(r.role, r)
+    return [{"role": r.role, "label": roles.label(r.role), "by": r.user_name, "note": r.note, "at": _iso(r.at)}
+            for r in latest.values()]
+
+
+class SignoffIn(BaseModel):
+    note: Optional[str] = None
+
+
+@app.post("/cases/{case_id}/signoff")
+def sign_off(case_id: str, payload: SignoffIn, request: Request,
+             current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _case_or_404(case_id, db)
+    role_key = roles.normalize(_role_of(current_user)) or "clinician"
+    db.add(roles_db.CaseSignoff(case_id=case_id, role=role_key, user_id=current_user.id,
+                                user_name=current_user.name, note=(payload.note or "").strip()[:500] or None))
+    db.commit()
+    request.state.audit_detail = "Signed off as %s" % roles.label(role_key)
+    return {"ok": True}
+
+
+def _audit_rows(q, limit):
+    return [{
+        "at": _iso(r.at), "user": r.user_name, "role": roles.label(r.role), "action": r.action,
+        "status": r.status_code, "detail": r.detail, "case_id": r.case_id,
+    } for r in q.order_by(roles_db.AuditEntry.at.desc()).limit(limit).all()]
+
+
+@app.get("/cases/{case_id}/audit")
+def case_audit(case_id: str, limit: int = 100, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if roles.is_restricted(_role_of(current_user)):
+        raise HTTPException(403, "The access log is available to the ocular oncologist and administrators.")
+    _case_or_404(case_id, db)
+    return _audit_rows(db.query(roles_db.AuditEntry).filter_by(case_id=case_id), min(max(limit, 1), 500))
+
+
+@app.get("/audit")
+def full_audit(limit: int = 200, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(current_user)
+    return _audit_rows(db.query(roles_db.AuditEntry), min(max(limit, 1), 1000))
 
 
 @app.get("/disease-profiles")
@@ -1096,9 +1526,10 @@ def list_all_open_tasks(current_user: User = Depends(get_current_user), db: Sess
         db.query(Task)
         .filter_by(status="open")
         .order_by(Task.due_date.is_(None), Task.due_date.asc())
-        .limit(10)
+        .limit(200)
         .all()
     )
+    tasks = _visible_tasks(tasks, current_user, db)[:10]
     return [
         {
             "id": t.id,
@@ -1497,6 +1928,190 @@ async def import_image_file(
 
     db.commit()
     return {"ok": True, "field_key": field_key, "imported": len(created_ids), "image_ids": created_ids}
+
+
+# uvealcare: smart import
+# Rules live in smart_import.py. This endpoint only wires them to the database.
+import smart_import
+from fastapi import Request as _SmartRequest
+
+
+@app.post("/cases/{case_id}/images/import-smart")
+async def import_images_smart(
+    case_id: str,
+    request: _SmartRequest,
+    files: list[UploadFile] = File(...),
+    field_key: str = Form("auto"),
+    neutral_names: bool = Form(True),
+    allow_mismatch: bool = Form(False),
+    only: str = Form(""),   # JSON list of file names: re-run just these
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    case = db.query(Case).filter_by(id=case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    imaging = (
+        db.query(DataFieldDefinition)
+        .filter_by(disease_profile_id=case.disease_profile_id, category="imaging")
+        .all()
+    )
+    labels = {f.key: f.label for f in imaging}
+    available = list(labels.keys())
+    forced = None
+    if field_key and field_key != "auto":
+        if field_key not in labels:
+            raise HTTPException(400, "Unknown study type for this case.")
+        forced = field_key
+
+    uploads = []
+    for f in files:
+        uploads.append((f.filename or "file", await f.read()))
+    if not uploads:
+        raise HTTPException(400, "No files were sent.")
+    sources, results = smart_import.expand(uploads)
+    del uploads
+    only_names = None
+    if only:
+        try:
+            only_names = set(json.loads(only))
+        except Exception:
+            raise HTTPException(400, "Couldn't read the list of files to re-run.")
+        sources = [s_ for s_ in sources if s_.name.replace("\\", "/").split("/")[-1] in only_names]
+        results = []
+
+    # ── Pass 1: look at each file's header only, decide where it goes ──
+    plan = []
+    for src in sources:
+        shown = src.name.replace("\\", "/").split("/")[-1]
+        res = {"name": shown, "status": "pending", "field_key": None, "field_label": None,
+               "images": 0, "reason": None, "problems": []}
+        try:
+            raw = src.read()
+            kind = smart_import.kind_of(src.name, raw[:200])
+            meta, text = None, ""
+            if kind == "dicom":
+                meta = smart_import.read_dicom_meta(raw)
+                if meta is None:
+                    res.update(status="skipped", reason="This isn't a readable DICOM file.")
+                    results.append(res)
+                    continue
+            elif kind == "pdf":
+                try:
+                    text = smart_import.pdf_text_only(raw)
+                except Exception:
+                    res.update(status="error", reason="This PDF couldn't be read.")
+                    results.append(res)
+                    continue
+            elif kind == "unknown":
+                res.update(status="skipped", reason="Not a DICOM, PDF, PNG or JPEG file.")
+                results.append(res)
+                continue
+            del raw
+        except Exception as exc:
+            res.update(status="error", reason="Couldn't read this file (%s)." % exc.__class__.__name__)
+            results.append(res)
+            continue
+
+        key, why = (forced, "you chose this study") if forced else smart_import.guess_study(meta, src.name, text, available)
+        if not key:
+            res.update(status="needs_study", reason="Couldn't tell which study this is. Choose one and import it again.")
+            results.append(res)
+            continue
+        res["field_key"], res["field_label"], res["detected_by"] = key, labels.get(key, key), why
+
+        problems = smart_import.identity_check(
+            meta, case.patient.mrn, case.patient.name, case.patient.laterality
+        )
+        if problems and not allow_mismatch:
+            res.update(status="held", problems=problems,
+                       reason="Held back. Tick \"import anyway\" if you're sure it's correct.")
+            results.append(res)
+            continue
+        res["problems"] = problems  # imported anyway, but still shown
+        plan.append({"src": src, "kind": kind, "meta": meta, "key": key, "res": res})
+
+    plan.sort(key=lambda p: (
+        p["key"],
+        (p["meta"] or {}).get("series_uid", ""),
+        (p["meta"] or {}).get("instance", 0),
+        p["src"].name,
+    ))
+
+    # ── Pass 2: convert and save one file at a time ──
+    totals = {}
+    imported_images = imported_files = 0
+    for item in plan:
+        res, key, src = item["res"], item["key"], item["src"]
+        try:
+            raw = src.read()
+            if item["kind"] == "dicom":
+                pngs = smart_import.dicom_to_pngs(raw)
+            elif item["kind"] == "pdf":
+                _, pngs = smart_import.pdf_text_and_pages(raw)
+            else:
+                pngs = [smart_import.image_to_png(raw)]
+            del raw
+        except Exception as exc:
+            msg = str(exc)
+            if "pylibjpeg" in msg or "gdcm" in msg.lower() or "transfer syntax" in msg.lower():
+                res.update(status="error", reason="This DICOM is compressed and the server can't open that kind yet. "
+                                                  "Re-export it uncompressed, or ask for decoder support to be added.")
+            else:
+                res.update(status="error", reason="Couldn't convert this file.")
+            results.append(res)
+            continue
+        if not pngs:
+            res.update(status="skipped", reason="Nothing importable inside.")
+            results.append(res)
+            continue
+
+        if key not in totals:
+            same = (ImageUpload.case_id == case_id) & (ImageUpload.field_key == key)
+            totals[key] = [
+                db.query(func.count(ImageUpload.id)).filter(same).scalar() or 0,
+                db.query(func.coalesce(func.sum(func.length(ImageUpload.data_base64)), 0)).filter(same).scalar() or 0,
+            ]
+        count, used = totals[key]
+        if count + len(pngs) > MAX_IMAGES_PER_STUDY:
+            res.update(status="skipped", reason="That would go over the limit of %d images in one study." % MAX_IMAGES_PER_STUDY)
+            results.append(res)
+            continue
+
+        base = src.name.replace("\\", "/").split("/")[-1]
+        base = base.rsplit(".", 1)[0] if "." in base else base
+        try:
+            for i, png in enumerate(pngs):
+                if neutral_names:
+                    nm = "%s_%d.png" % (labels.get(key, key).replace(" ", "-"), count + 1)
+                else:
+                    nm = ("%s.png" % base) if len(pngs) == 1 else ("%s_%d.png" % (base, i + 1))
+                _row, count, used = _append_image_row(db, case_id, key, nm, "image/png", png, count, used)
+            db.commit()
+            totals[key] = [count, used]
+            imported_images += len(pngs)
+            imported_files += 1
+            res.update(status="imported", images=len(pngs))
+        except HTTPException as exc:
+            db.rollback()
+            res.update(status="skipped", reason=str(exc.detail))
+        results.append(res)
+
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    request.state.audit_detail = "Smart import: %d image(s) from %d file(s); %s" % (
+        imported_images, imported_files,
+        ", ".join("%d %s" % (v, k.replace("_", " ")) for k, v in counts.items() if k != "imported") or "nothing held back",
+    )
+    return {
+        "ok": True,
+        "imported_images": imported_images,
+        "imported_files": imported_files,
+        "counts": counts,
+        "results": results,
+    }
 
 
 @app.get("/cases/{case_id}/images")
