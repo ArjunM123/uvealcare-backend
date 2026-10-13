@@ -16,3 +16,5 @@ Pillow
 pylibjpeg
 pylibjpeg-libjpeg
 pylibjpeg-openjpeg
+
+reportlab
